@@ -1,0 +1,12 @@
+# @local/token-usage —— 设置面板「词元用量统计」插件
+# Host 半：从会话日志折叠 token 用量（日×provider×model 聚合），storage-domain 持久化，
+#          /token-usage-rpc 同源路由出数；Client 半：settings.section 分区 + SVG 折线/柱状图。
+# 安装：plugin_manager install_bundle 指向本目录；卸载 remove_bundle 即完全移除。
+#
+# 注：行 name 用相对文件符 './host.js'（anchored beside 本 patch 文件）。
+# 全新安装/重启直接加载；仅「运行中不重启热改 Host 半」时受 Node ESM 按 URL 缓存限制
+# （改文件后 remove+install 不换模块代际）——把新代码另存新文件名并改这里即可换代，
+# 详见 README「Host 半热更流程」。
+- insert:
+    - id: token-usage
+      name: './host.js'

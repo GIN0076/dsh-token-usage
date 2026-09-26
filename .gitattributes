@@ -1,0 +1,2 @@
+# 统一 LF：插件文件要被宿主按字节读取与 diff，避免 autocrlf 换行漂移（教训 git-autocrlf-lf-crlf-drift）
+* text=auto eol=lf
