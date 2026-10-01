@@ -12,7 +12,10 @@
  * fork 去重：readSession 的 inheritedEventCount 为继承截断（事件 seq 连续从 1 起），
  * seq ≤ cut 不计 usage；实时路径不受影响——seed/setup 窗口事件从不经 session/event 重发。
  */
-import { accumulate, dataSpanOf, foldEvent, rollup, parseDay } from './stats.js'
+import { statSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import { accumulate, dataSpanOf, foldEvent, rollup, parseDay, normalizePriceTable, addDays, dayKeyOf } from './stats.js'
 
 export const name = 'token-usage'
 // connection：RPC 鉴权必需——Context 是严格代理，未 inject 的服务属性访问会抛错
@@ -90,6 +93,7 @@ export function apply(ctx) {
   const buffers = new Map()                // 未回填会话的在途事件缓冲 sessionId -> SessionEvent[]
   let globalBuffer = null                  // 重建期间：所有事件的缓冲（null = 不在重建）
   let backfill = null                      // { done, total } 启动回填进度
+  let orphanSessions = 0                   // 水位里「日志已不存在」的会话数（重建前提示用）
   let rebuilding = false
   let hydrated = false                     // 水合完成前不排补扫（防与磁盘水位双计）
   let domain = null
@@ -99,16 +103,18 @@ export function apply(ctx) {
   let flushTimer = null
   let scanChain = Promise.resolve()        // 扫描串行链：启动回填 / 单会话补扫 / 重建
 
-  const dailyTable = () => domain.table('daily')
-  const watermarkTable = () => domain.table('watermark')
+  const dailyTable = (handle = domain) => handle.table('daily')
+  const watermarkTable = (handle = domain) => handle.table('watermark')
 
   function markDirtyDaily(day, modelKey) { dirtyDaily.add(day + '\0' + modelKey) }
   function markDirtyWatermark(key) { dirtyWatermarks.add(key) }
 
   /** 异步落盘一批脏行。put/delete 在调用时同步入 domain 写链，因此先全部入链再统一等待——
-   *  收尾路径据此保证 close() 排空的是已入链的完整一批。 */
-  async function flushBatch() {
-    if (!domain) return
+   *  收尾路径据此保证 close() 排空的是已入链的完整一批。
+   *  @param handle - 目标域；缺省用当前 domain。卸载路径必须在 domain 置空之前显式传入，
+   *                  否则 `if (!handle) return` 会让最后一次落盘变成空操作（v1.0.0 的 bug）。 */
+  async function flushBatch(handle = domain) {
+    if (!handle) return
     const dayRows = [...dirtyDaily]
     const wmRows = [...dirtyWatermarks]
     dirtyDaily.clear()
@@ -116,8 +122,8 @@ export function apply(ctx) {
     if (!dayRows.length && !wmRows.length) return
     const ops = []
     try {
-      const dt = dailyTable()
-      const wt = watermarkTable()
+      const dt = dailyTable(handle)
+      const wt = watermarkTable(handle)
       for (const k of dayRows) {
         const sep = k.indexOf('\0')
         const day = k.slice(0, sep)
@@ -240,6 +246,62 @@ export function apply(ctx) {
     return scanChain
   }
 
+  // ── 回填健壮性（v1.2.0）：失败退避重试 + 缓冲上限 ──
+  // v1.1.x 的坑：缓冲只在「首次创建」时排一次回填，失败后不再重试——坏会话的事件只堆不折、无上限。
+  // 关键事实：缓冲里的事件是日志里已有内容的副本，backfillOne 会从日志全量重折叠（floor=水位），
+  // 所以**丢缓冲不丢数据**（前提是回填最终成功），据此设上限是安全的。
+  const BUFFER_LIMIT = 2000
+  const BACKFILL_RETRY_MS = [2000, 8000, 30000, 120000]
+  const backfillBusy = new Set()        // 已排队/在跑的会话（去重）
+  const backfillFails = new Map()       // sessionId -> 尝试次数
+  let bufferedDropped = 0
+
+  /** 排一次会话回填：去重 + 失败退避重试（超限后放弃并明确记日志）。 */
+  function scheduleBackfill(sessionId) {
+    if (known.has(sessionId) || backfillBusy.has(sessionId)) return
+    backfillBusy.add(sessionId)
+    enqueueScan(() => backfillOne(sessionId, false)).then(() => {
+      backfillBusy.delete(sessionId)
+      backfillFails.delete(sessionId)
+    }, (error) => {
+      backfillBusy.delete(sessionId)
+      const attempts = (backfillFails.get(sessionId) || 0) + 1
+      backfillFails.set(sessionId, attempts)
+      ctx.logger.warn('token-usage: backfill failed for ' + String(sessionId) + ' (attempt ' + attempts + '): ' + String(error))
+      if (attempts <= BACKFILL_RETRY_MS.length) {
+        const delay = BACKFILL_RETRY_MS[Math.min(attempts - 1, BACKFILL_RETRY_MS.length - 1)]
+        ctx.timeout(() => scheduleBackfill(sessionId), delay)
+      } else {
+        ctx.logger.error('token-usage: giving up backfill for ' + String(sessionId) + ' after ' + attempts
+          + ' attempts — its live events stay buffered (cap ' + BUFFER_LIMIT + '); use Rebuild to retry')
+      }
+    })
+  }
+
+  /** 未回填会话的缓冲水位（诊断用）。 */
+  function bufferStats() {
+    let events = 0
+    for (const [, buf] of buffers) events += buf.length
+    return { sessions: buffers.size, events, dropped: bufferedDropped, failed: backfillFails.size }
+  }
+
+  /** 当前存储里「日志已不存在」的会话数（= 历史里不可重建的部分）。 */
+  function orphansFrom(records) {
+    const alive = new Set(records.map((r) => r.header.id))
+    let orphans = 0
+    for (const [, row] of watermarks) if (!alive.has(row.sessionId)) orphans += 1
+    return orphans
+  }
+
+  async function countOrphanSessions() {
+    try {
+      return orphansFrom(await ctx.sessionQuery.listSessions())
+    } catch (error) {
+      ctx.logger.warn('token-usage: orphan scan failed (treated as 0): ' + String(error))
+      return 0
+    }
+  }
+
   /** 启动全量回填（尊重 bytes 快跳，进度可见）。 */
   async function runBootBackfill() {
     let records
@@ -250,13 +312,15 @@ export function apply(ctx) {
       return
     }
     backfill = { done: 0, total: records.length }
+    orphanSessions = orphansFrom(records)
     try {
       for (const record of records) {
         const id = record.header.id
         try {
           await enqueueScan(() => backfillOne(id, false))
         } catch (error) {
-          // 单会话失败不阻断整体；保持 unknown，下一条实时事件会重排补扫。
+          // 单会话失败不阻断整体；登记失败交由退避重试 / 收尾清扫。
+          backfillFails.set(id, (backfillFails.get(id) || 0) + 1)
           ctx.logger.warn('token-usage: backfill failed for ' + String(id) + ': ' + String(error))
         }
         backfill.done += 1
@@ -267,10 +331,12 @@ export function apply(ctx) {
       // 快照期间（或 listSessions 失败时）积压的未知会话缓冲：清扫补扫，防止饿死。
       for (const [id, buf] of buffers) {
         if (known.has(id) || !buf.length) { buffers.delete(id); continue }
-        enqueueScan(() => backfillOne(id, false)).catch((error) => {
-          ctx.logger.warn('token-usage: sweep backfill failed for ' + String(id) + ': ' + String(error))
-        })
+        scheduleBackfill(id)
       }
+      // 主循环里折过的失败会话（没有缓冲的也要给机会）
+      for (const id of backfillFails.keys()) scheduleBackfill(id)
+      // 保留期清理（默认关闭）在回填之后跑一次
+      try { pruneByRetention() } catch (error) { ctx.logger.warn('token-usage: retention prune failed: ' + String(error)) }
     }
   }
 
@@ -318,8 +384,8 @@ export function apply(ctx) {
         if (known.has(sessionId)) foldLive(sessionId, event)
         else {
           let b = buffers.get(sessionId)
-          if (!b) { b = []; buffers.set(sessionId, b); enqueueScan(() => backfillOne(sessionId, false)).catch(() => {}) }
-          b.push(event)
+          if (!b) { b = []; buffers.set(sessionId, b); scheduleBackfill(sessionId) }
+          pushBuffered(sessionId, b, event)
         }
       }
       scheduleFlush()
@@ -327,6 +393,19 @@ export function apply(ctx) {
   }
 
   // ── 实时折叠入口 ──
+  /** 往未回填会话的缓冲里塞事件；超上限丢最旧（缓冲只是日志的副本，回填会从日志重折叠）。 */
+  function pushBuffered(sessionId, buf, event) {
+    if (buf.length >= BUFFER_LIMIT) {
+      buf.shift()
+      bufferedDropped += 1
+      if (bufferedDropped === 1 || bufferedDropped % 500 === 0) {
+        ctx.logger.warn('token-usage: buffer for ' + String(sessionId) + ' hit the ' + BUFFER_LIMIT
+          + '-event cap; dropping oldest (total dropped ' + bufferedDropped + ') — backfill will refold from the log')
+      }
+    }
+    buf.push(event)
+  }
+
   const offEvents = ctx.on('session/event', (session, event) => {
     try {
       const sessionId = session.id
@@ -337,13 +416,9 @@ export function apply(ctx) {
           b = []
           buffers.set(sessionId, b)
           // 水合前不排补扫（启动回填会覆盖并抽干这些缓冲），只等回填来取。
-          if (hydrated) {
-            enqueueScan(() => backfillOne(sessionId, false)).catch((error) => {
-              ctx.logger.warn('token-usage: deferred backfill failed: ' + String(error))
-            })
-          }
+          if (hydrated) scheduleBackfill(sessionId)
         }
-        b.push(event)
+        pushBuffered(sessionId, b, event)
         return
       }
       foldLive(sessionId, event)
@@ -466,6 +541,134 @@ export function apply(ctx) {
 
   const ready = attachStorage()
 
+  // ── 价目表（可选，v1.1.0）：用户自备 JSON，插件**不内置任何价格** ──
+  // 路径 ~/.dsh/token-usage-prices.json（DSH_HOME 可覆盖）。单价单位 = 每百万 token，
+  // 币种取自表里的 currency。没有文件/表为空 = 未配置 → 界面不显示金额（不猜、不用别人的价）。
+  const PRICES_PATH = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'token-usage-prices.json')
+  let prices = null          // normalizePriceTable 结果；null = 未配置
+  let pricesText = ''        // 文件原文（供面板编辑器回显）
+  let pricesError = null     // 面向用户的解析错误
+  let pricesSig = '\u0000unloaded'
+
+  function pricesInfo() {
+    return {
+      path: PRICES_PATH,
+      configured: !!prices,
+      exists: pricesText !== '',
+      currency: prices ? prices.currency : null,
+      models: prices ? Object.keys(prices.models).length : 0,
+      hasDefault: !!(prices && prices.default),
+      error: pricesError,
+    }
+  }
+
+  /** 读价目表（按 mtime+长度做签名，未变则跳过；force 用于保存后强制重读）。 */
+  function readPrices(force) {
+    let raw = null
+    let mtime = -1
+    try {
+      mtime = statSync(PRICES_PATH).mtimeMs
+      raw = readFileSync(PRICES_PATH, 'utf8')
+    } catch {
+      raw = null
+    }
+    const sig = raw === null ? 'missing' : mtime + ':' + raw.length
+    if (!force && sig === pricesSig) return
+    pricesSig = sig
+    pricesText = raw === null ? '' : raw
+    pricesError = null
+    if (raw === null || !raw.trim()) { prices = null; return }
+    let parsed
+    try {
+      parsed = JSON.parse(raw)
+    } catch (error) {
+      prices = null
+      pricesError = 'JSON 解析失败：' + String((error && error.message) || error)
+      return
+    }
+    prices = normalizePriceTable(parsed)
+    if (!prices) pricesError = '表里没有可用价格：需要 models{"provider/model":{input,output}} 或 default{input,output}（单位=每百万 token）'
+  }
+
+  // ── 配置文件（v1.3.0）：~/.dsh/token-usage-config.json，面板内可编辑 ──
+  // 保持零依赖：不走插件 Config schema（那要 import 宿主包，桌面 asar 形态下得额外 pnpm 装依赖），
+  // 与价目表同款——用户可读可改的 JSON 文件。
+  const CONFIG_PATH = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'token-usage-config.json')
+  const CONFIG_DEFAULTS = { refreshSeconds: 60, budget: { daily: 0, monthly: 0 }, retentionDays: 0 }
+  let config = normalizeConfig(null)
+  let configText = ''
+  let configError = null
+  let configSig = '\u0000unloaded'
+
+  function clampNumber(v, min, max, fallback) {
+    return (typeof v === 'number' && Number.isFinite(v)) ? Math.min(max, Math.max(min, Math.round(v))) : fallback
+  }
+
+  /** 归一化配置：越界/非法一律取默认（配置写坏了插件也得照常跑）。 */
+  function normalizeConfig(raw) {
+    const base = { ...CONFIG_DEFAULTS, budget: { ...CONFIG_DEFAULTS.budget } }
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return base
+    base.refreshSeconds = clampNumber(raw.refreshSeconds, 15, 3600, CONFIG_DEFAULTS.refreshSeconds)
+    base.retentionDays = clampNumber(raw.retentionDays, 0, 3650, CONFIG_DEFAULTS.retentionDays)
+    const b = (raw.budget && typeof raw.budget === 'object' && !Array.isArray(raw.budget)) ? raw.budget : {}
+    for (const k of ['daily', 'monthly']) {
+      const v = b[k]
+      base.budget[k] = (typeof v === 'number' && Number.isFinite(v) && v >= 0) ? v : 0
+    }
+    return base
+  }
+
+  function configInfo() {
+    return { path: CONFIG_PATH, exists: configText !== '', error: configError, ...config }
+  }
+
+  /** 读配置（mtime+长度签名缓存；force 用于保存后强制重读）。 */
+  function readConfig(force) {
+    let raw = null
+    let mtime = -1
+    try {
+      mtime = statSync(CONFIG_PATH).mtimeMs
+      raw = readFileSync(CONFIG_PATH, 'utf8')
+    } catch {
+      raw = null
+    }
+    const sig = raw === null ? 'missing' : mtime + ':' + raw.length
+    if (!force && sig === configSig) return
+    configSig = sig
+    configText = raw === null ? '' : raw
+    configError = null
+    if (raw === null || !raw.trim()) { config = normalizeConfig(null); return }
+    let parsed
+    try {
+      parsed = JSON.parse(raw)
+    } catch (error) {
+      config = normalizeConfig(null)
+      configError = 'JSON 解析失败，已回落默认值：' + String((error && error.message) || error)
+      return
+    }
+    config = normalizeConfig(parsed)
+  }
+
+  /** 保留期清理（默认关闭；只删本地聚合行，事实源是会话日志，重建永远能长回来）。 */
+  function pruneByRetention() {
+    const days = config.retentionDays
+    if (!days) return 0
+    const cutoff = addDays(dayKeyOf(Date.now()), -days)
+    if (!cutoff) return 0
+    let removed = 0
+    for (const day of Object.keys(daily)) {
+      if (day >= cutoff) continue
+      for (const modelKey of Object.keys(daily[day])) markDirtyDaily(day, modelKey)
+      delete daily[day]
+      removed += 1
+    }
+    if (removed) {
+      ctx.logger.warn('token-usage: retention ' + days + 'd pruned ' + removed + ' day bucket(s) older than ' + cutoff)
+      scheduleFlush()
+    }
+    return removed
+  }
+
   // ── RPC 路由 ──
   function sendJson(res, status, payload) {
     res.statusCode = status
@@ -491,14 +694,105 @@ export function apply(ctx) {
       const fromDay = normDay(args.fromDay)
       const toDay = normDay(args.toDay)
       if (fromDay === null || toDay === null) return { ok: false, error: 'bad date' }
-      const result = rollup(daily, { granularity: String(args.granularity || 'day'), fromDay, toDay })
-      return { ok: true, data: { ...result, generatedAt: Date.now() } }
+      readPrices(false)
+      const result = rollup(daily, { granularity: String(args.granularity || 'day'), fromDay, toDay, prices: prices || undefined })
+      return { ok: true, data: { ...result, prices: pricesInfo(), generatedAt: Date.now() } }
     }
     if (action === 'status') {
-      return { ok: true, data: { backfill, rebuilding, storageOk, storageError, storageProbe, dataSpan: dataSpanOf(daily), generatedAt: Date.now() } }
+      readPrices(false)
+      readConfig(false)
+      return { ok: true, data: { backfill, rebuilding, storageOk, storageError, storageProbe, dataSpan: dataSpanOf(daily), prices: pricesInfo(), config: configInfo(), buffers: bufferStats(), orphanSessions, generatedAt: Date.now() } }
+    }
+    if (action === 'config') {
+      readConfig(false)
+      return { ok: true, data: { ...configInfo(), text: configText } }
+    }
+    if (action === 'config.save') {
+      const text = typeof body.text === 'string' ? body.text : (typeof args.text === 'string' ? args.text : '')
+      if (text.length > MAX_BODY_BYTES) return { ok: false, error: '配置过大（>64KB）' }
+      const trimmed = text.trim()
+      if (trimmed && trimmed !== '{}') {
+        try { JSON.parse(trimmed) } catch (error) {
+          return { ok: false, error: 'JSON 解析失败：' + String((error && error.message) || error) }
+        }
+      }
+      try {
+        if (!trimmed || trimmed === '{}') {
+          try { unlinkSync(CONFIG_PATH) } catch { /* 本来就没有 */ }
+        } else {
+          const tmp = CONFIG_PATH + '.tmp'
+          writeFileSync(tmp, text, 'utf8')
+          renameSync(tmp, CONFIG_PATH)
+        }
+      } catch (error) {
+        return { ok: false, error: '写入失败：' + String((error && error.message) || error) }
+      }
+      configSig = '\u0000unloaded'
+      readConfig(true)
+      const pruned = pruneByRetention()
+      return { ok: true, data: { ...configInfo(), text: configText, prunedDays: pruned } }
+    }
+    if (action === 'summary') {
+      // 预算要用「今天 / 本月」的口径，与当前面板区间无关
+      readPrices(false)
+      readConfig(false)
+      const today = dayKeyOf(Date.now())
+      const monthStart = today.slice(0, 7) + '-01'
+      const dayRollup = rollup(daily, { granularity: 'day', fromDay: today, toDay: today, prices: prices || undefined })
+      const monthRollup = rollup(daily, { granularity: 'day', fromDay: monthStart, toDay: today, prices: prices || undefined })
+      return {
+        ok: true,
+        data: {
+          day: today,
+          today: { totals: dayRollup.totals, cost: dayRollup.cost || null },
+          month: { fromDay: monthStart, totals: monthRollup.totals, cost: monthRollup.cost || null },
+          budget: { ...config.budget, currency: prices ? prices.currency : null },
+          generatedAt: Date.now(),
+        },
+      }
+    }
+    if (action === 'prices') {
+      readPrices(false)
+      return { ok: true, data: { ...pricesInfo(), text: pricesText } }
+    }
+    if (action === 'prices.save') {
+      const text = typeof body.text === 'string' ? body.text : (typeof args.text === 'string' ? args.text : '')
+      if (text.length > MAX_BODY_BYTES) return { ok: false, error: '价格表过大（>64KB）' }
+      const trimmed = text.trim()
+      if (trimmed && trimmed !== '{}') {
+        let parsed
+        try { parsed = JSON.parse(trimmed) } catch (error) {
+          return { ok: false, error: 'JSON 解析失败：' + String((error && error.message) || error) }
+        }
+        if (!normalizePriceTable(parsed)) {
+          return { ok: false, error: '没有可用价格：需要 models{"provider/model":{input,output}} 或 default{input,output}（单位=每百万 token）' }
+        }
+      }
+      try {
+        if (!trimmed || trimmed === '{}') {
+          try { unlinkSync(PRICES_PATH) } catch { /* 本来就没有 */ }
+        } else {
+          const tmp = PRICES_PATH + '.tmp'
+          writeFileSync(tmp, text, 'utf8')
+          renameSync(tmp, PRICES_PATH)   // 原子替换，防写坏半个文件
+        }
+      } catch (error) {
+        return { ok: false, error: '写入失败：' + String((error && error.message) || error) }
+      }
+      pricesSig = '\u0000unloaded'
+      readPrices(true)
+      return { ok: true, data: { ...pricesInfo(), text: pricesText } }
     }
     if (action === 'rebuild') {
       if (rebuilding) return { ok: true, data: { started: false } }
+      // v1.2.0 防呆：存储里有「日志已不存在」的历史时，先要一次显式确认——
+      // rebuild 会清空存储并只重扫现存日志，那部分历史将永久消失（不可重建）。
+      if (args.confirm !== true) {
+        const orphans = await countOrphanSessions()
+        if (orphans > 0) {
+          return { ok: true, data: { started: false, needsConfirm: true, orphanSessions: orphans } }
+        }
+      }
       rebuilding = true
       // doRebuild 自身作为链上 job 执行（其内部已改为直接折叠，不再自排链）。
       enqueueScan(doRebuild).catch((error) => {
@@ -516,25 +810,44 @@ export function apply(ctx) {
       kind: 'exact',
       path: RPC_PATH,
       handler: async (req, res) => {
-        // 连接鉴权（与 open-in-app 同款：cookie/token 校验，401/403 直接终止）
+        // 请求事实（诊断用；**不回显 cookie 值**，只回有无）
+        const seen = {
+          host: String((req.headers && req.headers.host) || ''),
+          origin: String((req.headers && req.headers.origin) || ''),
+          site: String((req.headers && req.headers['sec-fetch-site']) || ''),
+          cookie: /(?:^|;\s*)dsh-auth-/.test(String((req.headers && req.headers.cookie) || '')) ? 'present' : 'missing',
+        }
+        // 连接鉴权（与 open-in-app 同款：cookie/token 校验）。宿主是信任判定的**唯一权威**。
         const connection = Reflect.get(ctx, 'connection')
         if (connection && typeof connection.requestRejection === 'function') {
           const rejection = connection.requestRejection(req)
-          if (rejection) { res.statusCode = rejection; res.end(); return }
+          if (rejection) {
+            sendJson(res, rejection, {
+              ok: false,
+              error: rejection === 401 ? 'unauthenticated' : 'untrusted request',
+              hint: rejection === 401
+                ? '缺少/失效的 dsh-auth-* cookie：请从桌面 App 内访问（浏览器直连需带 token 换 cookie），然后硬刷新页面'
+                : 'Host/Origin 未通过宿主信任判定：请从本机 127.0.0.1 访问，不要用外部域名或伪造来源',
+              seen,
+            })
+            return
+          }
         }
-        // 回环 Host + 同源 Origin 栅栏（防 DNS rebinding / 跨站 CSRF）
-        const hostHeader = String(req.headers.host || '')
-        const origin = req.headers.origin ? String(req.headers.origin) : ''
-        const hostName = hostHeader.replace(/:\d+$/, '')
+        // 自办栅栏仅作兜底（composition 里没有 connection 服务时）——桌面壳转发会剥掉 Origin，
+        // 所以这里只认「Host 是回环」+「带 Origin 时必须同源」。
+        const hostName = seen.host.replace(/:\d+$/, '')
         const loopback = hostName === '127.0.0.1' || hostName === 'localhost' || hostName === '[::1]' || hostName === '::1'
-        if (!loopback) { res.statusCode = 403; res.end('forbidden'); return }
-        if (origin && origin !== 'http://' + hostHeader && origin !== 'https://' + hostHeader) {
-          res.statusCode = 403; res.end('forbidden'); return
+        if (!loopback) {
+          sendJson(res, 403, { ok: false, error: 'untrusted host', hint: 'Host 不是回环地址（127.0.0.1/localhost）', seen })
+          return
+        }
+        if (seen.origin && seen.origin !== 'http://' + seen.host && seen.origin !== 'https://' + seen.host) {
+          sendJson(res, 403, { ok: false, error: 'cross-origin', hint: 'Origin 与 Host 不同源', seen })
+          return
         }
         if (req.method !== 'POST') {
-          res.statusCode = 405
           res.setHeader('allow', 'POST')
-          res.end()
+          sendJson(res, 405, { ok: false, error: 'method not allowed', hint: '本路由只接受 POST（application/json）', seen })
           return
         }
         const essence = String(req.headers['content-type'] || '').split(';', 1)[0].trim().toLowerCase()
@@ -574,10 +887,11 @@ export function apply(ctx) {
   return () => {
     if (domain) {
       const dom = domain
+      // 先把这一拍脏行同步入链（flushBatch 首个 await 之前完成「标脏清点 + 全部 put/delete」），
+      // 再 close() 排空整批——顺序不可倒置。句柄显式传入：v1.0.0 先置空 domain 再调 flushBatch()，
+      // 撞上 `if (!handle) return` 直接空转，最后一次落盘从未发生。
+      try { void flushBatch(dom) } catch { /* ignore */ }
       domain = null
-      // flushBatch 首个 await 之前同步完成「标脏清点 + 全部 put/delete 入写链」，
-      // 随后 close() 排空已入链的整批——顺序不可倒置。
-      try { void flushBatch() } catch { /* ignore */ }
       try {
         void dom.close().catch((error) => { ctx.logger.warn('token-usage: domain close failed: ' + String(error)) })
       } catch (error) { ctx.logger.warn('token-usage: domain close threw: ' + String(error)) }

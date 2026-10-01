@@ -7,6 +7,7 @@
 import {
   normalizeUsage, foldEvent, accumulate, rollup,
   dayKeyOf, mondayKeyOf, monthKeyOf, bucketKeysBetween, addDays, dataSpanOf,
+  normalizePrice, normalizePriceTable, priceFor, costOf,
 } from './stats.js'
 
 let passed = 0
@@ -67,6 +68,28 @@ hit = foldEvent(ctx, ev(5, 'assistant/message', T, {
   stream: [{ type: 'chunk', time: T, chunk: { type: 'usage', usage: { inputTokens: 4, outputTokens: 1 } } }],
 }))
 check('usage from stream chunk when data.usage absent', hit?.usage.total === 5)
+
+// 压缩摘要路由：事件自带 provider/model 优先（0.2.0-rc.2 实测 data 里就有）
+const sumCtx = { seq: 0, cut: 0, route: { provider: 'header-p', model: 'header-m' } }
+const sumOwn = foldEvent(sumCtx, ev(6, 'compaction/summary', T, {
+  provider: 'deepseek-account', model: 'deepseek-flash',
+  usage: { inputTokens: 5, outputTokens: 5 },
+}))
+check('summary prefers its own provider/model', sumOwn?.modelKey === 'deepseek-account/deepseek-flash' && sumOwn.kind === 'summary',
+  JSON.stringify(sumOwn))
+const sumFallback = foldEvent(sumCtx, ev(7, 'compaction/summary', T, {
+  usage: { inputTokens: 5, outputTokens: 5 },
+}))
+check('summary falls back to header route', sumFallback?.modelKey === 'header-p/header-m')
+const sumHalf = foldEvent(sumCtx, ev(8, 'compaction/summary', T, {
+  provider: 'only-provider',
+  usage: { inputTokens: 1, outputTokens: 1 },
+}))
+check('summary half-filled route falls back', sumHalf?.modelKey === 'header-p/header-m')
+const sumOrphan = foldEvent({ seq: 0, cut: 0, route: undefined }, ev(9, 'compaction/summary', T, {
+  usage: { inputTokens: 5, outputTokens: 5 },
+}))
+check('summary without any route lands on compaction/unknown', sumOrphan?.modelKey === 'compaction/unknown')
 
 // ── 3. fork 继承前缀去重 ──
 const fork = { seq: 0, cut: 10, route: undefined }
@@ -167,6 +190,47 @@ check('accumulate sums', acc['2026-09-24']['a/b'].total === 7 && acc['2026-09-24
 // dayKeyOf 本地时区
 const midnight = new Date(2026, 8, 24, 0, 0, 0).getTime()
 check('dayKeyOf local midnight', dayKeyOf(midnight) === '2026-09-24')
+
+// ── 7. 价目表与成本（可选功能：未配置就不出金额，绝不内置价格）──
+check('price needs input+output', normalizePrice({ input: 1 }) === null && normalizePrice({ output: 2 }) === null)
+check('price rejects negative/NaN', normalizePrice({ input: -1, output: 2 }) === null && normalizePrice({ input: 1, output: NaN }) === null)
+check('cache buckets default to input price', (() => {
+  const p = normalizePrice({ input: 3, output: 9 })
+  return p !== null && p.cacheRead === 3 && p.cacheWrite === 3
+})())
+check('explicit cache price wins', normalizePrice({ input: 3, output: 9, cacheRead: 0.3, cacheWrite: 4 })?.cacheRead === 0.3)
+check('empty table is null (unconfigured)', normalizePriceTable({}) === null && normalizePriceTable(null) === null && normalizePriceTable({ models: {} }) === null)
+check('table keeps valid rows, drops bad ones, default ¥', (() => {
+  const table = normalizePriceTable({ models: { 'a/b': { input: 1, output: 2 }, bad: { input: 'x' } } })
+  return table !== null && table.currency === '¥' && Object.keys(table.models).length === 1 && table.models['a/b'].output === 2
+})())
+check('table currency override + default fallback', (() => {
+  const table = normalizePriceTable({ currency: '$', models: { 'a/b': { input: 1, output: 1 } }, default: { input: 2, output: 2 } })
+  return table !== null && table.currency === '$' && priceFor(table, 'a/b').input === 1 && priceFor(table, 'x/y').input === 2
+})())
+check('priceFor unknown without default is null', priceFor(normalizePriceTable({ models: { 'a/b': { input: 1, output: 1 } } }), 'z/z') === null)
+check('cost = Σ(bucket × price) / 1e6', (() => {
+  const p = normalizePrice({ input: 1, output: 2, cacheRead: 0.5, cacheWrite: 1 })
+  const cost = costOf({ input: 1e6, output: 1e6, cacheRead: 1e6, cacheWrite: 1e6 }, p)
+  return Math.abs(cost - 4.5) < 1e-9
+})())
+check('costOf without price is null', costOf({ input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, null) === null)
+
+const pricedRollup = rollup(daily, {
+  granularity: 'day', fromDay: '2026-09-21', toDay: '2026-10-07',
+  prices: normalizePriceTable({ models: { 'p/m': { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 } } }),
+})
+const pricedModel = pricedRollup.models.find((m) => m.key === 'p/m')
+check('rollup attaches per-model cost when priced',
+  Math.abs(pricedModel.cost - (pricedModel.input + pricedModel.output + pricedModel.cacheRead + pricedModel.cacheWrite) / 1e6) < 1e-12,
+  String(pricedModel.cost))
+check('rollup cost covers priced models only, counts the rest',
+  pricedRollup.cost.pricedModels === 1 && pricedRollup.cost.unpricedModels === 1
+  && Math.abs(pricedRollup.cost.total - pricedModel.cost) < 1e-12 && pricedRollup.cost.unpricedTokens === 300,
+  JSON.stringify(pricedRollup.cost))
+const unpricedRollup = rollup(daily, { granularity: 'day' })
+check('rollup without prices carries no cost field',
+  unpricedRollup.cost === undefined && unpricedRollup.models[0].cost === undefined)
 
 // ── 结果 ──
 if (fails.length) {

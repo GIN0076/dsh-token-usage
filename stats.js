@@ -4,7 +4,10 @@
  * 口径（方案 §三）：
  *  - 计费事件：assistant/message（data.usage 或流末 usage chunk，路由取 message.source）、
  *    assistant/attempt（流末 usage chunk，路由取会话最近 request/header）、
- *    compaction/summary（data.usage，路由同上，无路由归 compaction/unknown）；
+ *    compaction/summary（data.usage，路由优先取事件自带的 data.provider/data.model，
+ *    缺则回退最近 request/header，再缺归 compaction/unknown）；
+ *    注：0.2.0-rc.2 实测 assistant/attempt 事件不携带 usage（17 条样本 0 命中），
+ *    即上游不报重试/失败调用的花费——该分支是防御性保留，不是"重试也计费"的保证。
  *  - 非法计数整体跳过（与 token-meter fail-closed 一致）：计数须为安全非负整数、
  *    reasoning ≤ output、totalTokens 须与已知桶自洽；
  *  - 事件时间落本地日桶；周桶 = 周一起始；月桶 = 自然月；
@@ -211,7 +214,13 @@ export function foldEvent(ctx, event) {
   if (event.type === 'compaction/summary') {
     const usage = normalizeUsage(data && data.usage)
     if (!usage) return null
-    return { dayKey, modelKey: routeKey(ctx.route) ?? 'compaction/unknown', usage, kind: 'summary' }
+    // 摘要事件自带 provider/model（0.2.0-rc.2 实测 data 里有这两个字段），优先采信；
+    // 没有再退回最近一次请求头路由——否则压缩的账会记到别的模型头上。
+    const own = (data && typeof data.provider === 'string' && data.provider
+      && typeof data.model === 'string' && data.model)
+      ? { provider: data.provider, model: data.model }
+      : null
+    return { dayKey, modelKey: routeKey(own) ?? routeKey(ctx.route) ?? 'compaction/unknown', usage, kind: 'summary' }
   }
   return null
 }
@@ -267,6 +276,63 @@ export function bucketKeyOfDay(granularity, day) {
   return day
 }
 
+// ── 价目表与成本（可选功能；插件本身不内置任何价格，避免拿别人的价当成你的价）──
+// 单位约定：单价 = **每百万 token 的价格**（币种由 table.currency 决定，缺省 ¥）。
+// 价目表形状：{ currency?: '¥', models: { 'provider/model': {input, output, cacheRead?, cacheWrite?} }, default?: {...} }
+// cacheRead / cacheWrite 缺省时回退到 input 单价；未定价的桶不猜。
+
+function priceNumber(v) {
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null
+}
+
+/** 单个单价对象归一化（input/output 必需且非负有限；缓存桶缺省回退 input）。 */
+export function normalizePrice(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const input = priceNumber(raw.input)
+  const output = priceNumber(raw.output)
+  if (input === null || output === null) return null
+  const cacheRead = raw.cacheRead === undefined ? input : priceNumber(raw.cacheRead)
+  const cacheWrite = raw.cacheWrite === undefined ? input : priceNumber(raw.cacheWrite)
+  if (cacheRead === null || cacheWrite === null) return null
+  return { input, output, cacheRead, cacheWrite }
+}
+
+/**
+ * 价目表归一化；无任何可用价格返回 null（= 未配置，界面据此隐藏金额）。
+ * @returns {{currency:string, models:Object, default?:Object} | null}
+ */
+export function normalizePriceTable(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const models = Object.create(null)
+  const src = (raw.models && typeof raw.models === 'object' && !Array.isArray(raw.models)) ? raw.models : {}
+  for (const key of Object.keys(src)) {
+    if (typeof key !== 'string' || !key) continue
+    const price = normalizePrice(src[key])
+    if (price) models[key] = price
+  }
+  const fallback = normalizePrice(raw.default)
+  if (!Object.keys(models).length && !fallback) return null
+  const table = { currency: (typeof raw.currency === 'string' && raw.currency) ? raw.currency : '¥', models }
+  if (fallback) table.default = fallback
+  return table
+}
+
+/** 某模型的单价：精确键 → default → null（不猜）。 */
+export function priceFor(table, modelKey) {
+  if (!table) return null
+  if (table.models && Object.prototype.hasOwnProperty.call(table.models, modelKey)) return table.models[modelKey]
+  return table.default || null
+}
+
+/** 成本 = Σ(桶 × 单价) / 1e6；无单价返回 null。 */
+export function costOf(counts, price) {
+  if (!price || !counts) return null
+  return (counts.input * price.input
+    + counts.output * price.output
+    + counts.cacheRead * price.cacheRead
+    + counts.cacheWrite * price.cacheWrite) / 1e6
+}
+
 function emptyTotals() {
   return { input: 0, output: 0, total: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, calls: 0 }
 }
@@ -282,13 +348,15 @@ function addTo(dst, src, calls) {
 }
 
 /**
- * 区间聚合：连续桶 + 模型排名 + 总计。
+ * 区间聚合：连续桶 + 模型排名 + 总计（+ 可选成本）。
  *
  * @param daily - 聚合体 { dayKey: { modelKey: counts } }。
- * @param options - { granularity: 'day'|'week'|'month', fromDay?, toDay? }（缺省跨度 = 数据最早日至今天）。
- * @returns { granularity, range, buckets, models, totals, dataSpan, empty }
+ * @param options - { granularity: 'day'|'week'|'month', fromDay?, toDay?, prices? }（缺省跨度 = 数据最早日至今天）。
+ *   prices 为 `normalizePriceTable` 的结果；给了就为每个模型附 `cost`（未定价为 null）
+ *   并返回 `cost` 汇总（含已/未定价模型数与 token 数，便于界面提示"金额偏低"）。
+ * @returns { granularity, range, buckets, models, totals, dataSpan, empty, cost? }
  */
-export function rollup(daily, { granularity, fromDay, toDay }) {
+export function rollup(daily, { granularity, fromDay, toDay, prices }) {
   if (granularity !== 'day' && granularity !== 'week' && granularity !== 'month') {
     throw new Error('token-usage: unknown granularity ' + String(granularity))
   }
@@ -350,7 +418,7 @@ export function rollup(daily, { granularity, fromDay, toDay }) {
   const grand = totals.total || 0
   for (const m of models) m.share = grand > 0 ? m.total / grand : 0
 
-  return {
+  const result = {
     granularity,
     range: { fromDay: start, toDay: end },
     buckets: keys.map(k => bucketMap.get(k)),
@@ -359,4 +427,21 @@ export function rollup(daily, { granularity, fromDay, toDay }) {
     dataSpan: span,
     empty: inRangeRows === 0,
   }
+
+  if (prices) {
+    let cost = 0
+    let pricedModels = 0
+    let unpricedModels = 0
+    let pricedTokens = 0
+    let unpricedTokens = 0
+    for (const m of models) {
+      const price = priceFor(prices, m.key)
+      m.cost = price ? costOf(m, price) : null
+      if (price) { cost += m.cost; pricedModels += 1; pricedTokens += m.total }
+      else { unpricedModels += 1; unpricedTokens += m.total }
+    }
+    result.cost = { currency: prices.currency, total: cost, pricedModels, unpricedModels, pricedTokens, unpricedTokens }
+  }
+
+  return result
 }

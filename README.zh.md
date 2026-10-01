@@ -7,7 +7,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-ffd93d?style=flat-square&labelColor=2b2b2b)](LICENSE)
 [![DSH Plugin](https://img.shields.io/badge/DSH-Plugin-4f8ef7?style=flat-square&labelColor=2b2b2b)](#-安装)
-[![Version](https://img.shields.io/badge/version-1.0.0-22b07d?style=flat-square&labelColor=2b2b2b)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.3.0-22b07d?style=flat-square&labelColor=2b2b2b)](CHANGELOG.md)
 [![Zero Deps](https://img.shields.io/badge/zero--deps-🟩_纯_SVG_零构建-e0566b?style=flat-square&labelColor=2b2b2b)](#-它怎么工作)
 [![Local Only](https://img.shields.io/badge/本地优先-🔒_数据不出机-9b6bff?style=flat-square&labelColor=2b2b2b)](#-隐私)
 
@@ -24,47 +24,88 @@ DSH 很能干活，但**它花了你多少 token**？账户页只给余额，原
 现在，打开 **设置 → 📊 词元用量**，答案直接画在你面前：
 
 ```text
-┌───────────────────────────────────────────────────────────────┐
-│ 📊 词元用量统计      ( 日 | 周 | 月 )  [近 30 天 ▾]  [↻ 重新统计] │
-├───────────────────────────────────────────────────────────────┤
-│ ┌───────────┐ ┌───────────┐ ┌───────────┐ ┌───────────┐       │
-│ │ 总词元 🧮  │ │  输入 ⬇️   │ │  输出 ⬆️   │ │ 请求数 📞  │       │
-│ │  9.9 亿   │ │  6.1 亿   │ │  840 万   │ │   947     │       │
-│ └───────────┘ └───────────┘ └───────────┘ └───────────┘       │
-│                                                               │
-│ 📈 趋势折线图            ✦ 悬浮任意一天 → 当天各模型逐个拆开        │
-│     80M ┤            ╭─╮                                      │
-│     40M ┤   ╭──╮  ╭──╯ ╰──╮       ─── 合计                    │
-│         ┼───┴──┴──┴───────┴───      ─── alpha-chat            │
-│          06-02    06-06    06-10     ─── beta-reason           │
-│                                                               │
-│ 🏆 模型排名柱状图                                               │
-│     alpha-chat       ████████████████░░░░  62.4%              │
-│     beta-reason      █████░░░░░░░░░░░░░░░  31.8%              │
-│     gamma-mini       ▍                      5.8%              │
-└───────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────┐
+│ 📊 词元用量统计  ( 日 | 周 | 月 )  [近 30 天 ▾]   [导出] [价目表] [设置] [↻ 重新统计] │
+├────────────────────────────────────────────────────────────────────────────┤
+│ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐          │
+│ │总词元🧮│ │ ¥成本  │ │ 输入⬇️ │ │ 输出⬆️ │ │缓存读🗃️│ │缓存命中│          │
+│ │ 11.4亿 │ │ ¥3.42  │ │ 946.4万│ │ 145.8万│ │ 11.3亿 │ │ 99.2%  │          │
+│ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘          │
+│ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐                     │
+│ │ 今日   │ │ 本月   │ │ 预算   │ │ 请求数 │ │ 桶数   │   ← 预算超支会变红    │
+│ │ 2.26亿 │ │ 11.4亿 │ │¥1.5/¥10│ │  3239  │ │   3    │                     │
+│ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘                     │
+│                                                                            │
+│ 📈 词元用量统计 · 日 · 共 3 个桶    2026-09-29 → 2026-10-01（3 天）· 悬浮查看明细 │
+│     80M ┤            ╭─╮                                                   │
+│     40M ┤   ╭──╮  ╭──╯ ╰──╮       ─── 合计                                 │
+│         ┼───┴──┴──┴───────┴───      ─── alpha-chat                         │
+│          06-02    06-06    06-10     ─── beta-reason                        │
+│                                                                            │
+│ 🏆 排行 · 占比            ( 按模型 | 按厂商 )  [按金额 ▾]                    │
+│     alpha-chat       ████████████████░░░░  62.4% · ¥2.13                   │
+│     beta-reason      █████░░░░░░░░░░░░░░░  31.8% · ¥1.09                   │
+│     gamma-mini       ▍                      5.8% · ¥0.20                   │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
-> 🖼️ 界面示意图（schematic）。实际渲染跟随 DSH 主题 token，**明暗模式都好看**。
+> 🖼️ 界面示意图（schematic）。金额 / 预算 / 今日 / 本月这几张卡**要先配价目表**（和可选的预算）才出现；
+> 实际渲染跟随 DSH 主题 token，**明暗模式都好看**。
 
 ## 🎯 功能一览
 
 | 分组 | 能力 |
 |---|---|
-| 📅 **粒度** | **日 / 周 / 月** 一键切换——周一起始、自然月；只存日桶，切粒度**零成本即时生效** |
+| 📅 **粒度** | **日 / 周 / 月** 一键切换——周一起始、自然月；只存日桶，切粒度**零成本即时生效**。注意：汇总卡与排行榜是**整段区间的合计**（不随粒度变），随粒度变的是折线图分组与「**桶数**」卡 |
 | 🗓️ **时间自定义** | 预设（近 7 天 / 30 天 / 12 周 / 12 个月 / 全部）+ **自定义起止日期**，任意范围出图 |
 | 📈 **折线图** | 合计粗线 + 每模型细线，**悬浮十字线**逐日拆明细，图例点击开关单个模型 |
-| 🏆 **柱状图** | 模型总量横向排名 + 占比%，一眼看出谁是吞金兽 💸 |
-| 🔁 **重新统计** | 一键全量重扫重建——幂等，水位防双计、防漏计 |
-| 🛡 **统计口径** | 脏数据 fail-closed 跳过、**重试的请求照样计费**、fork 继承不双计、compaction 也入账 |
+| 🏆 **柱状图** | 模型总量横向排名 + 占比% + 金额，一眼看出谁是吞金兽 💸 |
+| 💰 **成本估算** | 自带价目表（`~/.dsh/token-usage-prices.json`，面板内可编辑），按**每百万 token 单价**估算金额；**插件不内置任何价格**，没配就不显示金额 |
+| 💸 **预算与今日/本月** | 汇总卡带「今日 / 本月」固定口径；配了预算 + 价目表后出**预算卡**（`¥已花 / ¥预算`），**超支变红** |
+| 🏷️ **多维度看数** | 排行榜与折线图可切「**按模型 / 按厂商**」；配了价目表后排行榜还能**按金额**排序 |
+| ⚙️ **可配置** | 面板「设置」直接编辑 `~/.dsh/token-usage-config.json`：刷新间隔 / 预算 / 保留期 |
+| 📊 **统计面** | 汇总卡：总词元 / 金额 / 输入 / 输出 / 缓存读 / 缓存写 / 推理 / **缓存命中率** / 请求数 / 模型数 |
+| 📤 **导出** | 当前区间导出 **CSV**（桶 × 模型逐行 + 模型小计 + 总计）与 **JSON**，可复制或下载 |
+| 🔄 **自动刷新** | 页面可见时每 60 秒静默重取，切回前台立即刷新，隐藏时完全不发请求 |
+| 🔁 **重新统计** | 一键全量重扫重建——幂等，水位防双计、防漏计；**若存储里有「日志已不存在」的历史会先弹确认**（那部分无法重建，防手滑） |
+| 🛡 **统计口径** | 脏数据 fail-closed 跳过、**摘要按事件自带 provider/model 归属**、fork 继承不双计、compaction 也入账 |
+
+## 💰 成本怎么算（可选）
+
+插件**不内置任何价格**——别人的价目表不等于你的账单。想看到金额，就在面板点「价目表」填一张：
+
+```json
+{
+  "currency": "¥",
+  "models": {
+    "deepseek-account/deepseek-flash": { "input": 1, "output": 2, "cacheRead": 0.1, "cacheWrite": 1 }
+  },
+  "default": { "input": 1, "output": 2 }
+}
+```
+
+- 单位 = **每百万 token 的价格**（币种取 `currency`，缺省 ¥）；模型键就是面板上显示的 `provider/model`
+- `cacheRead`/`cacheWrite` 不填 → 按 `input` 价计；`default` 是兜底（没列出的模型按它算）
+- 存到 `~/.dsh/token-usage-prices.json`（写入是「先写临时文件再原子替换」，不会写坏半个文件）
+- 面板顶部「价目表 → 填入模板」会**把你当前数据里出现过的模型全列出来**，填数字即可
+- 没定价的模型会被单独计数并在面板上明示「金额只算了有价的部分」——不会拿 0 糊弄你
+- 清空内容再保存 = 关掉金额显示
+
+> 价格是**估算**，不是账单：以 provider 官方计费为准。
 
 ## 🚀 安装
 
 **方式一 · GitHub 一键（推荐，DSH 标准通道）**
 
 ```powershell
-dsh plugin --profile web add github:GIN0076/dsh-token-usage
+# 桌面版（本机默认运行的 profile 就是 desktop）
+dsh plugin --profile desktop add github:GIN0076/dsh-token-usage
+# 或不指定 profile，装进当前默认 profile
+dsh plugin add github:GIN0076/dsh-token-usage
 ```
+
+> ⚠️ 别照抄成 `--profile web`：那是网页版 profile，桌面 App 读的是 `desktop`，
+> 装错 profile 会出现「命令成功、面板里啥也没有」。
 
 **方式二 · 克隆后本地安装（离线可用，本仓开发期实测通道）**
 
@@ -93,10 +134,12 @@ git clone https://github.com/GIN0076/dsh-token-usage.git
  Client 半 ──▶ 设置面板分区 + 纯 SVG 双图（无图表库、无构建、零依赖）
 ```
 
-**明细口径**（`stats.js` 纯函数，46 项夹具把关）：
+**明细口径**（`stats.js` 纯函数，63 项夹具把关）：
 
-- ✅ 计入：`assistant/message`（含流内 usage）、**`assistant/attempt`——重试也花钱！**、`compaction/summary`
-- 🏷️ 路由归属：消息自带 provider/model；尝试/压缩归最近一次请求头
+- ✅ 计入：`assistant/message`（含流内 usage）、`compaction/summary`（**按事件自带的 provider/model 归属**）
+- ⚠️ 支持但不承诺：`assistant/attempt` 也走同一条折叠逻辑，但 **0.2.0-rc.2 实测该事件不携带 usage**
+  （18 个会话 / 17 条 attempt / 0 命中）——**重试与失败调用的花费上游不报，插件无源可算**，别指望这里能看出重试成本
+- 🏷️ 路由归属：消息自带 provider/model；摘要优先自带、缺则回退最近一次请求头；尝试归最近请求头
 - 🚫 跳过：非安全整数、负数、reasoning > output、total 与分桶矛盾的脏数据
 - 🕐 时间桶落**宿主本地时区**；fork 继承前缀按 `inheritedEventCount` 截断——不算两遍祖先的账
 
@@ -118,19 +161,22 @@ git clone https://github.com/GIN0076/dsh-token-usage.git
        - daily：日 × provider/model × 六桶计数
        - watermark：会话水位 { seq, route, bytes }
    · /token-usage-rpc 精确路由（连接鉴权 + 回环 Host + 同源 Origin 三重栅栏）
-       - stats {granularity, fromDay, toDay} → 聚合（stats.js 纯函数）
-       - status → { backfill, rebuilding, storageOk, dataSpan }
-       - rebuild → 清空全量重扫（暂停折叠 + 缓冲补折防竞态）
+       - stats {granularity, fromDay, toDay} → 聚合（stats.js 纯函数，带价目表时附成本）
+       - status → { backfill, rebuilding, storageOk, dataSpan, prices }
+       - rebuild → 清空全量重扫（暂停折叠 + 缓冲补折防竞态；**存储含无源历史时先返回 needsConfirm**）
+       - prices / prices.save → 读/写 ~/.dsh/token-usage-prices.json（写前校验 + 临时文件原子替换）
+   · 鉴权/同源拒绝一律带 JSON 诊断体 {error, hint, seen{host,origin,site,cookie}}（不回显 cookie 值）
       ▼ 同源 POST fetch
  Client 半 client.js（静态 bundle，__ModuleLoader__）
    · settings.section 分区（id: token-usage, order: 50）
    · 日/周/月分段 + 预设区间（近7天/30天/12周/12个月/全部/自定义起止日期）+ 重新统计
    · 汇总卡 → 趋势折线图（合计粗线 + 每模型细线 + 悬浮十字线明细 + 图例开关）→ 模型排名柱状图
+   · 价目表编辑器（模板/校验/保存）· 导出弹层（CSV/JSON，复制或下载）· 可见时 60s 自动刷新
 ```
 
 | 文件 | 职责 |
 |---|---|
-| `stats.js` | 纯聚合函数；`node stats.fixtures.mjs` 跑 **46 项夹具**（口径/去重/周月桶/自定义范围/滚算一致性） |
+| `stats.js` | 纯聚合函数；`node stats.fixtures.mjs` 跑 **63 项夹具**（口径/去重/路由归属/周月桶/自定义范围/滚算一致性/**价目表与成本**） |
 | `host.js` | Host 半：折叠、回填、重建、存储、RPC |
 | `client.js` | Client 半：分区、控件、两张 SVG 图表 |
 | `cordis.patch.yml` | bundle patch 行（相对文件符 `./host.js`） |
@@ -142,7 +188,7 @@ git clone https://github.com/GIN0076/dsh-token-usage.git
 |---|---|
 | 改 **Client 半**（界面/图表） | 编辑 `client.js` → **硬刷新页面即生效**（client-hmr 换 rev） |
 | 改 **Host 半**（统计/RPC） | 编辑 `host.js` → **重启 DSH**；运行中不重启热改受 Node ESM 按 URL 缓存所限，需换文件名强制换代（见下） |
-| 跑测试 | `node stats.fixtures.mjs`（46 项） |
+| 跑测试 | `node stats.fixtures.mjs`（63）+ `node client.i18n.fixtures.mjs`（257）+ `node client.smoke.mjs`（51） |
 | 语法检查 | `node --check host.js && node --check client.js && node --check stats.js` |
 
 **Host 半热更流程**（运行中不重启时）：改 `host.js` → `Copy-Item host.js host2.js` →

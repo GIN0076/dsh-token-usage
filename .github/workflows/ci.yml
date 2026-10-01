@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Syntax check
+        run: |
+          node --check index.js
+          node --check host.js
+          node --check client.js
+          node --check stats.js
+      - name: Manifest is valid JSON
+        run: node -e "JSON.parse(require('fs').readFileSync('package.json','utf8')); console.log('package.json OK')"
+      - name: Pure-function fixtures
+        run: node stats.fixtures.mjs
+      - name: Client i18n parity
+        run: node client.i18n.fixtures.mjs
+      - name: Client offline smoke (mini React + fake fetch)
+        run: node client.smoke.mjs
